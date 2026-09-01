@@ -1,0 +1,10 @@
+api_version = 1
+name = "BF_DAG"
+component_kind = "Module"
+type = "Scheduler"
+version = { major = 0, minor = 0, patch = 1 }
+author = "armscream"
+description = "Directed Acyclic Graph task and systems scheduler — lock-free parallel work-stealing runtime."
+flags = ["Runtime", "Provides_Service"]
+capabilities = ["Custom"]
+dependency_count = 0
