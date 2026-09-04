@@ -16,19 +16,11 @@ import "core:sync"
 import "core:thread"
 
 Worker_Context :: struct {
-	id:          int,
+	id:           int,
 	steal_cursor: int,
-	runtime:     ^Scheduler_Runtime,
-	local_queue: ^Work_Deque,
-	inbox:       ^Worker_Inbox,
-	allocator:   mem.Allocator,
-}
-
-INBOX_CAPACITY :: 4096
-Worker_Inbox :: struct {
-	buffer: []int,
-	head: i32,
-	tail: i32,
+	runtime:      ^Scheduler_Runtime,
+	local_queue:  ^Work_Deque,
+	allocator:    mem.Allocator,
 }
 
 // Worker_Mask :: bit_set[Scheduler_Worker]
@@ -66,7 +58,6 @@ worker_thread_main :: proc(worker: ^Worker_Context) {
 }
 
 worker_try_execute_one :: proc(worker: ^Worker_Context) -> bool {
-	worker_drain_inbox(worker)
 	idx, ok := deque_pop(worker.local_queue)
 	if !ok {idx = worker_steal_node(worker)}
 	if idx < 0 do return false
@@ -76,7 +67,6 @@ worker_try_execute_one :: proc(worker: ^Worker_Context) -> bool {
 worker_execute_loop :: proc(worker: ^Worker_Context, main_thread: bool) {
 	runtime := worker.runtime
 	budget_warned := false
-	stall_spins := 0
 
 	for {
 		if !runtime.running do return
@@ -85,7 +75,7 @@ worker_execute_loop :: proc(worker: ^Worker_Context, main_thread: bool) {
 
 		if !main_thread && sync.atomic_load(&runtime.frame_active) == 0 {
 			budget_warned = false
-			worker_sleep_hint()
+			thread.yield()
 			continue
 		}
 
@@ -114,44 +104,23 @@ worker_execute_loop :: proc(worker: ^Worker_Context, main_thread: bool) {
 			budget_warned = false
 		}
 
-		if worker_try_execute_one(worker) {
-			stall_spins = 0
-			continue
-		}
+		if worker_try_execute_one(worker) do continue
 
 		if main_thread {
 			remaining_now := sync.atomic_load(&runtime.remaining_tasks)
 			ready_now := sync.atomic_load(&runtime.ready_tasks)
 
 			if remaining_now > 0 && ready_now == 0 {
-				// Let scheduler_wait_frame own the block/deadlock
-				// handling path.
+				// No currently ready work exists while work is still
+				// outstanding.
+				//
+				// Do not manufacture completion. Leave the frame alive
+				// and let scheduler_wait_frame / diagnostics handle it.
+				// Removed stall spin here.
 				return
 			}
-
-			if remaining_now > 0 && ready_now <= 0 {
-				stall_spins += 1
-				if stall_spins > 200000 {
-					when SCHED_TRACE_WARN {
-						fmt.printf(
-							"SCHED WARN worker[%d] stalled with remaining=%d ready=%d; forcing frame drain\n",
-							worker.id,
-							remaining_now,
-							ready_now,
-						)
-					}
-					sync.atomic_store(&runtime.remaining_tasks, 0)
-					sync.mutex_lock(&runtime.frame_mutex)
-					sync.cond_broadcast(&runtime.frame_cond)
-					sync.mutex_unlock(&runtime.frame_mutex)
-					return
-				}
-			} else {
-				stall_spins = 0
-			}
 		}
-
-		worker_sleep_hint()
+		thread.yield()
 	}
 }
 
@@ -189,16 +158,14 @@ worker_pop_node :: proc(worker: ^Worker_Context) -> int {
 	return node
 }
 
-// ================================================================
-// Work Stealing (pre-computed candidate lists)
-// ================================================================
-
+//* Work Stealing (pre-computed candidate lists)
 worker_steal_node :: proc(worker: ^Worker_Context) -> int {
 	count := worker.runtime.worker_count
 	if count <= 1 do return -1
 	start := worker.steal_cursor % count
-	for offset in 0..< count - 1 {
-		victim := (start + offset - 1) % count
+	for offset in 1 ..< count {
+		victim := (start + offset) % count
+		if victim == worker.id do continue
 		node, ok := deque_steal(&worker.runtime.deques[victim])
 		if ok {
 			worker.steal_cursor = (victim + 1) % count
@@ -206,18 +173,7 @@ worker_steal_node :: proc(worker: ^Worker_Context) -> int {
 		}
 	}
 	worker.steal_cursor = (start + 1) % count
-	return -1 
-}
-
-// ================================================================
-// Sleep Hint (NOT blocking engine)
-// ================================================================
-//
-// Replaces the legacy empty `for 0..<100 {}` spin. Yields the thread
-// back to the OS scheduler so other workers (and the main thread) can
-// run while we're between work units.
-worker_sleep_hint :: proc() {
-	thread.yield()
+	return -1
 }
 
 worker_load_guard :: proc(worker: ^Worker_Context) -> bool {

@@ -17,35 +17,24 @@
 // ownership story are different.
 package BF_DAG
 
+import "../../Core"
 import "core:fmt"
 import "core:mem"
 import "core:sync"
 import "core:thread"
-import "../../Core"
 
 // compile DAG from system registry
-scheduler_compile_frame :: proc(
-	runtime: ^Scheduler_Runtime,
-	registry: ^System_Registry,
-) {
+scheduler_compile_frame :: proc(runtime: ^Scheduler_Runtime, registry: ^System_Registry) {
 	if len(runtime.node_runtime) > 0 {
-		// `delete` on a [dynamic] uses the allocator stored in the
-		// array header (set at `make` time via runtime.allocator), so
-		// this is the correct call regardless of context.allocator.
 		delete(runtime.node_runtime)
 		runtime.node_runtime = nil
 	}
-
 	if len(runtime.compiled_dag.task_ids) > 0 {
 		dag_clear(&runtime.compiled_dag, runtime.allocator)
 	}
 
 	runtime.compiled_dag = compile_frame_dag(registry, runtime.worker_count, runtime.allocator)
 	runtime.active_dag = &runtime.compiled_dag
-
-	fmt.println("========== COMPILED DAG ==========")
-	fmt.println("Systems:", len(registry.systems))
-
 	runtime.node_runtime = make(
 		[dynamic]Node_Runtime,
 		len(runtime.compiled_dag.task_ids),
@@ -54,16 +43,21 @@ scheduler_compile_frame :: proc(
 
 	for i in 0 ..< len(runtime.compiled_dag.task_ids) {
 		runtime.node_runtime[i] = Node_Runtime {
-			dependency_mask = runtime.compiled_dag.dep_masks[i],
-			executed        = 0,
+			remaining = runtime.compiled_dag.dependencies_count[i],
+			state     = NODE_WAITING,
 		}
 	}
 
 	runtime.remaining_tasks = 0
+	runtime.ready_tasks = 0
 
-	max_depth := len(runtime.compiled_dag.depth)
-
-	fmt.println("===============================")
+	when SCHED_TRACE_SUMMARY {
+		fmt.printf(
+			"BF_DAG compiled: systems=%d edges=%d\n",
+			len(runtime.compiled_dag.task_ids),
+			len(runtime.compiled_dag.dependencies_flat),
+		)
+	}
 }
 
 scheduler_runtime_init :: proc(
@@ -208,9 +202,7 @@ scheduler_destroy :: proc(runtime: ^Scheduler_Runtime) {
 	runtime.active_dag = nil
 }
 
-// ================================================================
-// Frame Begin
-// ================================================================
+//* Frame Begin
 scheduler_begin_frame :: proc(runtime: ^Scheduler_Runtime, frame: ^Core.Scheduler_Frame) {
 	dag := runtime.active_dag
 	frame_budget_begin(runtime, 16.6)
@@ -226,38 +218,28 @@ scheduler_begin_frame :: proc(runtime: ^Scheduler_Runtime, frame: ^Core.Schedule
 			runtime.worker_count,
 		)
 	}
-
-	for i in 0 ..< len(dag.task_ids) {
-		runtime.node_runtime[i].dependency_mask = dag.dep_masks[i]
-		runtime.node_runtime[i].executed = 0
-	}
-
 	for i in 0 ..< len(runtime.deques) {deque_reset(&runtime.deques[i])}
-
 	ready_count: i32 = 0
-
-	// enqueue root nodes - Using deque
+	// Root nodes are initially placed on worker 0.
+	// Worker 0 is the engine/main thread and owns this deque.
+	// other workers will steal from it.
 	for i in 0 ..< len(dag.task_ids) {
-		if dag.dep_masks[i] != 0 do continue
-
-		rt := &runtime.node_runtime[i]
-		if sync.atomic_compare_exchange_weak(&rt.executed, NODE_WAITING, NODE_QUEUED) != NODE_WAITING do continue
-
-		w := int(dag.owner_worker[i])
-
-		if deque_push(&runtime.deques[w], i) {
-			ready_count += 1
-		} else {
-			sync.atomic_store(&rt.executed, NODE_WAITING)
-			when SCHED_TRACE_WARN {
-				fmt.printf("SCHED WARN root drop node=%d worker=%d queue_full\n", i, w)
-			}
+		if dag.dependencies_count[i] != 0 {
+			continue
 		}
 
-		when SCHED_TRACE_VERBOSE {fmt.printf("SCHED enqueue root node=%d worker=%d\n", i, w)}
+		rt := &runtime.node_runtime[i]
+		if sync.atomic_compare_exchange_weak(&rt.state, NODE_WAITING, NODE_READY) != NODE_WAITING do continue
+		if !deque_push(&runtime.deques[0], i) {panic("BF_DAG: failed to enqueue root node")}
+		ready_count += 1
 	}
-
 	sync.atomic_store(&runtime.ready_tasks, ready_count)
+
+	for i in 0 ..< len(dag.task_ids) {
+		rt := &runtime.node_runtime[i]
+		sync.atomic_store(&rt.remaining, dag.dependencies_count[i])
+		sync.atomic_store(&rt.state, NODE_WAITING)
+	}
 
 	when SCHED_TRACE_SUMMARY {
 		fmt.printf(
@@ -300,10 +282,7 @@ scheduler_run_main_worker :: proc(runtime: ^Scheduler_Runtime) {
 	}
 }
 
-scheduler_run_main_worker_slice :: proc(
-	runtime: ^Scheduler_Runtime,
-	max_steps: int = 1,
-) -> int {
+scheduler_run_main_worker_slice :: proc(runtime: ^Scheduler_Runtime, max_steps: int = 1) -> int {
 	if max_steps <= 0 do return 0
 
 	ran: int = 0
@@ -402,5 +381,8 @@ scheduler_create :: proc(
 
 // Exposed API, mostly for renderer gpu fences, networking, async asset streaming, audio callbacks, OS events, procedural generation,
 // & editor background jobs. Without introducing fibers.
-scheduler_external_create :: proc(runtime: ^Scheduler_Runtime, name: string) -> External_Node_Handle
+scheduler_external_create :: proc(
+	runtime: ^Scheduler_Runtime,
+	name: string,
+) -> External_Node_Handle
 scheduler_external_signal :: proc(runtime: ^Scheduler_Runtime, handle: External_Node_Handle)
