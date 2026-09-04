@@ -21,9 +21,6 @@
 package BF_DAG
 
 import "core:log"
-import "core:mem"
-import "core:sync"
-import "core:thread"
 import "../../Core"
 
 // ============================================================================

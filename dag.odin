@@ -5,7 +5,7 @@
 // node per system, computes the dependency bitmask (stage ordering +
 // same-stage access conflicts + explicit before/after edges), and
 // pre-computes everything the worker loop needs (depth, dependents,
-// owner_worker, cache_group, cost estimate).
+// owner_worker, cost estimate).
 //
 // Ported from DagScheduler/Dag.odin (Ymir engine). The only changes:
 //   * System_Registry.systems now uses System_Entry (System_ID + name +
@@ -14,24 +14,29 @@
 //     in Bifrost (they were scattered across Dag.odin in Ymir).
 package BF_DAG
 
-import "core:fmt"
+import "../../Core"
 import "core:mem"
 import "core:time"
-import "../../Core"
 
 Frame_DAG :: struct {
-	task_ids:         []Task,
-	dep_masks:        []u64,
-	self_bits:        []u64,
-	preferred_worker: []i16,
-	preferred_numa:   []i16,
-	cache_group:      []u32,
-	depth:            []i32,
-	cost_estimate:    []f32,
-	dependents_start: []i32,
-	dependents_count: []i32,
-	dependents_flat:  []i32,
-	owner_worker:     []i16,
+	task_ids:           []Task,
+	// Dependencies -> node
+	dependencies_start: []i32,
+	dependencies_count: []i32,
+	dependencies_flat:  []i32,
+	//  Node -> dependencies
+	dependents_start:   []i32,
+	dependents_count:   []i32,
+	dependents_flat:    []i32,
+	// Topological metadata
+	topo_order:         []i32,
+	depth:              []i32,
+	// Scheduler hints
+	preferred_worker:   []i16,
+	// Cost metadata
+	cost_estimate:      []f32,
+	critical_cost:      []f32,
+	generation:         u64,
 }
 
 Frame_Dependency_Storage :: struct {
@@ -41,8 +46,10 @@ Frame_Dependency_Storage :: struct {
 }
 
 Frame_Island :: struct {
-	priority:  f32,
-	pred_cost: f32,
+	critical_cost: f32,
+	start:         i32,
+	count:         i32,
+	depth:         i32,
 }
 
 Frame_Budget :: struct {
@@ -52,20 +59,45 @@ Frame_Budget :: struct {
 	frame_start_ns: u64,
 }
 
-SIMD_WIDTH            :: 4
-INVALID_CACHE_GROUP   :: u32(0xFFFFFFFF)
+SIMD_WIDTH :: 4
 
 SIMD_Batch :: struct {
 	nodes: [SIMD_WIDTH]int,
 	count: int,
 }
 
-// --- NEW procs
-dag_assign_numa :: proc(dag: ^Frame_DAG) {
+dag_topological_sort :: proc(dag: ^Frame_DAG, allocator: mem.Allocator) -> bool {
 	n := len(dag.task_ids)
 
-	// simple alternating NUMA heuristic (no graph traversal)
-	for i in 0 ..< n {dag.preferred_numa[i] = i16(i % 2)}
+	indegree := make([]i32, n, allocator)
+	queue := make([]i32, 0, n, allocator)
+
+	for 1 in 0 ..< n {
+		indegree[i] = dag.dependencies_count[i]
+		if indegree[i] == 0 {
+			append(&queue, i)
+		}
+	}
+	dag.topo_order = make([]i32, 0, n, allocator)
+	head := 0
+	for head < len(queue) {
+		node := queue[head]
+		append(&dag.topo_order, node)
+		start := dag.dependents_count[node]
+		count := dag.dependents_count[node]
+
+		for j in 0 ..< count {
+			dependent := dag.dependents_flat[start + j]
+			indegree[dependent] -= 1
+			if indegree[dependent] == 0 {
+				append(&queue, dependent)
+			}
+		}
+	}
+	ok := len(dag.topo_order) == n
+	delete(indegree, allocator)
+	delete(queue, allocator)
+	return ok
 }
 
 compile_frame_dag :: proc(
@@ -132,11 +164,9 @@ compile_frame_dag :: proc(
 	// ---------------------------------------------------------
 	// 3. Metadata passes (SOA ONLY)
 	// ---------------------------------------------------------
-	dag_assign_numa(&dag)
 	dag_assign_worker_affinity_compile(&dag, worker_count)
 	dag_compute_depths(&dag)
-	dag_assign_cache_groups(&dag)
-	dag_estimate_costs(&dag)
+	dag_compute_critical_cost(&dag)
 	dag_build_dependents(&dag, allocator)
 	dag_compile_owner_worker(&dag, worker_count)
 
@@ -223,36 +253,38 @@ dag_assign_worker_affinity_compile :: proc(dag: ^Frame_DAG, worker_count: int) {
 
 dag_compute_depths :: proc(dag: ^Frame_DAG) {
 	n := len(dag.task_ids)
-
-	// initialize
-	for i in 0 ..< n {dag.depth[i] = 0}
-
-	// propagate depth using bitmasks
 	for i in 0 ..< n {
-		for j in 0 ..< n {
-			if (dag.dep_masks[i] & dag.self_bits[j]) != 0 {
-				if dag.depth[j] < dag.depth[i] + 1 {
-					dag.depth[j] = dag.depth[i] + 1
-				}
+		dag.depth[i] = 0
+	}
+	for order_index in 0 ..< len(dag.topo_order) {
+		node := dag.topo_order[order_index]
+		start := dag.dependents_start[node]
+		count := dag.dependents_count[node]
+		for j in 0 ..< count {
+			dependent := dag.dependents_flat[start + j]
+			next_depth := dag.depth[node] + 1
+			if dag.depth[dependent] < next_depth {
+				dag.depth[dependent] = next_depth
 			}
 		}
 	}
 }
 
-dag_assign_cache_groups :: proc(dag: ^Frame_DAG) {
-	n := len(dag.task_ids)
-
-	for i in 0 ..< n {dag.cache_group[i] = u32(i & 3)}
-}
-
-dag_estimate_costs :: proc(dag: ^Frame_DAG) {
-	for i in 0 ..< len(dag.task_ids) {
-		cost: f32 = 1.0
-		cost += f32(dag.depth[i])
-
-		if (dag.dep_masks[i] != 0) {cost += 0.5}
-
-		dag.cost_estimate[i] = cost
+dag_compute_critical_cost :: proc(dag: ^Frame_DAG) {
+	m := len(dag.task_ids)
+	for i in 0 ..< n {
+		dag.critical_cost[i] = dag.cost_estimate[i]
+	}
+	// Reverse topo order.
+	for order_index := len(dag.topo_order) - 1; order_index >= 0; order_index -= 1 {
+		node := dag.topo_order[order_index]
+		start := dag.dependents_start[node]
+		count := dag.dependents_count[node]
+		for j in 0 ..< count {
+			dependent := dag.dependents_flat[start + j]
+			candidate := dag.cost_estimate[node] + dag.critical_cost[dependent]
+			if candidate > dag.critical_cost[node] {dag.critical_cost[node] = candidate}
+		}
 	}
 }
 
@@ -271,36 +303,32 @@ dag_sort_islands :: proc(islands: []Frame_Island) {
 
 dag_init :: proc(dag: ^Frame_DAG, n: int, worker_count: int, allocator: mem.Allocator) {
 	dag.task_ids = make([]Task, n, allocator)
-	dag.dep_masks = make([]u64, n, allocator)
-	dag.self_bits = make([]u64, n, allocator)
-
 	dag.preferred_worker = make([]i16, n, allocator)
-	dag.preferred_numa = make([]i16, n, allocator)
-	dag.cache_group = make([]u32, n, allocator)
 
 	dag.depth = make([]i32, n, allocator)
 	dag.cost_estimate = make([]f32, n, allocator)
 
+	dag.dependencies_start = make([]i32, n, allocator)
+	dag.dependencies_count = make([]i32, n, allocator)
+	dag.dependencies_flat = make([]i32, 0, allocator)
+
 	dag.dependents_start = make([]i32, n, allocator)
 	dag.dependents_count = make([]i32, n, allocator)
 	dag.dependents_flat = make([]i32, 0, allocator)
-	dag.owner_worker = make([]i16, n, allocator)
 }
 
 dag_clear :: proc(dag: ^Frame_DAG, allocator: mem.Allocator) {
 	// Use delete for slices, not clear
 	delete(dag.task_ids, allocator)
-	delete(dag.dep_masks, allocator)
-	delete(dag.self_bits, allocator)
 	delete(dag.preferred_worker, allocator)
-	delete(dag.preferred_numa, allocator)
-	delete(dag.cache_group, allocator)
 	delete(dag.depth, allocator)
+	delete(dag.dependencies_start, allocator)
+	delete(dag.dependencies_count, allocator)
+	delete(dag.dependencies_flat, allocator)
 	delete(dag.cost_estimate, allocator)
 	delete(dag.dependents_start, allocator)
 	delete(dag.dependents_count, allocator)
 	delete(dag.dependents_flat, allocator)
-	delete(dag.owner_worker, allocator)
 }
 
 distance_cost :: proc(dag: ^Frame_DAG, node_index: int, w: ^Worker_Context) -> f32 {

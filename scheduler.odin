@@ -11,59 +11,65 @@
 // from (world, engine, dt) to (rawptr -> Scheduler_Frame).
 package BF_DAG
 
+import "../../Core"
 import "core:fmt"
 import "core:mem"
 import "core:sync"
 import "core:thread"
-import "../../Core"
 
 SCHED_TRACE_SUMMARY :: false
-SCHED_TRACE_WARN    :: true
+SCHED_TRACE_WARN :: true
 SCHED_TRACE_VERBOSE :: false
-SCHED_TRACE         :: SCHED_TRACE_VERBOSE
+SCHED_TRACE :: SCHED_TRACE_VERBOSE
 
 // Temporary safety mode while lock-free multithread scheduler is being
 // stabilized.
 SCHED_FORCE_SINGLE_THREAD :: false
-SCHED_ENABLE_STEALING     :: true
+SCHED_ENABLE_STEALING :: true
 
 Node_Runtime :: struct {
-	dependency_mask: u64,
-	executed:        i32, // 0 = waiting, 1 = queued, 2 = claimed/executed
+	remaining: i32,
+	state:     i32,
+}
+
+Node_Kind :: enum u8{
+	System,
+	External,
 }
 
 NODE_WAITING :: i32(0)
-NODE_QUEUED  :: i32(1)
-NODE_CLAIMED :: i32(2)
+NODE_READY :: i32(1)
+NODE_RUNNING :: i32(2)
+NODE_COMPLETE :: i32(3)
 
 Scheduler_Runtime :: struct {
-	allocator:        mem.Allocator,
-	worker_count:     int,
-	workers:          []Worker_Context,
-	threads:          []^thread.Thread,
-	node_runtime:     [dynamic]Node_Runtime,
-	deques:           []Work_Deque,
-	active_dag:       ^Frame_DAG,
-	compiled_dag:     Frame_DAG,
-	active_frame:     ^Core.Scheduler_Frame,
-	global_tick:      u64,
-	current_pass:     i32,
-	next_worker:      int,
-	running:          bool,
-	workers_started:  bool,
-	frame_active:     i32,
+	allocator:       mem.Allocator,
+	worker_count:    int,
+	workers:         []Worker_Context,
+	threads:         []^thread.Thread,
+	node_runtime:    [dynamic]Node_Runtime,
+	deques:          []Work_Deque,
+	active_dag:      ^Frame_DAG,
+	compiled_dag:    Frame_DAG,
+	active_frame:    ^Core.Scheduler_Frame,
+	global_tick:     u64,
+	current_pass:    i32,
+	next_worker:     int,
+	running:         bool,
+	workers_started: bool,
+	frame_active:    i32,
 	// frame_gen is bumped exactly once per drained frame, by the worker
 	// that observed remaining_tasks reach 0. The main thread reads it
 	// in scheduler_wait_frame instead of taking a mutex on every frame.
-	frame_gen:        u64,
-	inflight_exec:    i32,
-	ready_tasks:      i32,
-	remaining_tasks:  i32,
-	frame_mutex:      sync.Mutex,
-	frame_cond:       sync.Cond,
-	wake_mutex:       sync.Mutex,
-	wake_cond:        sync.Cond,
-	frame_budget:     Frame_Budget,
+	frame_gen:       u64,
+	inflight_exec:   i32,
+	ready_tasks:     i32,
+	remaining_tasks: i32,
+	frame_mutex:     sync.Mutex,
+	frame_cond:      sync.Cond,
+	wake_mutex:      sync.Mutex,
+	wake_cond:       sync.Cond,
+	frame_budget:    Frame_Budget,
 }
 
 // NUMA_Partition struct needed for this to work
@@ -104,16 +110,16 @@ scheduler_ready_dec :: proc(runtime: ^Scheduler_Runtime) {
 // ================================================================
 // Inject Task (from frame graph / system builder)
 // ================================================================
-scheduler_submit_node :: proc(
-	runtime: ^Scheduler_Runtime,
-	node_index: int,
-	worker_id: int,
-) {
+scheduler_submit_node :: proc(runtime: ^Scheduler_Runtime, node_index: int, worker_id: int) {
 	rt := &runtime.node_runtime[node_index]
 
 	if sync.atomic_compare_exchange_weak(&rt.executed, NODE_WAITING, NODE_QUEUED) != NODE_WAITING do return
 
-	when SCHED_TRACE_VERBOSE {fmt.printf("SCHED submit node %d to worker %d\n", node_index, worker_id)}
+	when SCHED_TRACE_VERBOSE {fmt.printf(
+			"SCHED submit node %d to worker %d\n",
+			node_index,
+			worker_id,
+		)}
 
 	// force ready by clearing deps
 	rt.dependency_mask = 0
@@ -126,11 +132,7 @@ scheduler_submit_node :: proc(
 	} else {
 		sync.atomic_store(&rt.executed, NODE_WAITING)
 		when SCHED_TRACE_WARN {
-			fmt.printf(
-				"SCHED WARN submit drop node=%d worker=%d queue_full\n",
-				node_index,
-				w,
-			)
+			fmt.printf("SCHED WARN submit drop node=%d worker=%d queue_full\n", node_index, w)
 		}
 	}
 }
@@ -159,69 +161,38 @@ scheduler_get_worker :: proc(runtime: ^Scheduler_Runtime, id: int) -> ^Worker_Co
 
 wake_dependents :: proc(node_index: int, runtime: ^Scheduler_Runtime, producer_worker: int) {
 	dag := runtime.active_dag
-
 	start := dag.dependents_start[node_index]
 	count := dag.dependents_count[node_index]
-
-	completed_bit := dag.self_bits[node_index]
 
 	when SCHED_TRACE_VERBOSE {fmt.printf("SCHED wake dependents of node %d\n", node_index)}
 
 	for k in 0 ..< count {
-		i := dag.dependents_flat[start + k]
-		rt := &runtime.node_runtime[i]
+		dependent := int(dag.dependents_flat[start + k])
+		rt := &runtime.node_runtime[dependent]
+		previous := sync.atomic_sub(&rt.remaining, 1)
+		if previous != 1 do continue
+		// This dependency was the final one
+		if sync.atomic_compare_exchange_weak(&rt.state, NODE_WAITING, NODE_READY) != NODE_WAITING do continue 
+		scheduler_enqueue_ready(runtime, dependent, producer_worker)
+	}
+}
 
-		if sync.atomic_load(&rt.executed) == NODE_CLAIMED {
-			continue
-		}
-		// remove dependency
-		mask := &rt.dependency_mask
-
-		for {
-			old := sync.atomic_load(mask)
-			new := old & ~completed_bit
-			//
-			// Someone else already woke it.
-			//
-			if old == new {break}
-
-			prev := sync.atomic_compare_exchange_weak(mask, old, new)
-			if prev == old {
-				if new == 0 {
-					if sync.atomic_compare_exchange_weak(&rt.executed, NODE_WAITING, NODE_QUEUED) !=
-					   NODE_WAITING {
-						break
-					}
-
-					w := producer_worker
-					if w < 0 || w >= runtime.worker_count {w = 0}
-
-					if deque_push(&runtime.deques[w], int(i)) {
-						scheduler_ready_inc(runtime)
-
-						when SCHED_TRACE_VERBOSE {
-							fmt.printf(
-								"SCHED wake dependent node=%d -> worker=%d ready=%d\n",
-								i,
-								w,
-								sync.atomic_load(&runtime.ready_tasks),
-							)
-						}
-					} else {
-						sync.atomic_store(&rt.executed, NODE_WAITING)
-						when SCHED_TRACE_WARN {
-							fmt.printf(
-								"SCHED WARN wake drop node=%d worker=%d queue_full\n",
-								i,
-								w,
-							)
-						}
-					}
-				}
-				break
-			}
+scheduler_enqueue_ready :: proc(runtime: ^Scheduler_Runtime, node_index: int, producer_worker: int){
+	dag := runtime.active_dag
+	preferred := int(dag.preferred_worker[node_index])
+	target := producer_worker
+	if preferred >0 && preferred < runtime.worker_count {
+		// TODO: For now, producer locality wins, preferred worker remains only a hint.
+	}
+	if target < 0 || target >= runtime.worker_count {target = 0}
+	if target == producer_worker {
+		if deque_push(&runtime.deques[target], node_index) {
+			sync.atomic_add(&runtime.ready_tasks, 1)
+			return
 		}
 	}
+	worker_inbox_push(&runtime.workers[target], node_index)
+	sync.atomic_add(&runtime.ready_tasks, 1)
 }
 
 execute_node :: proc(node_index: int, runtime: ^Scheduler_Runtime, worker_id: int) -> bool {
@@ -288,7 +259,11 @@ node_complete :: proc(node_index: int, runtime: ^Scheduler_Runtime) {
 	remaining_before := sync.atomic_sub(&runtime.remaining_tasks, 1)
 	remaining_after := remaining_before - 1
 
-	when SCHED_TRACE_VERBOSE {fmt.printf("SCHED node %d completed. Remaining tasks: %d\n", node_index, remaining_after)}
+	when SCHED_TRACE_VERBOSE {fmt.printf(
+			"SCHED node %d completed. Remaining tasks: %d\n",
+			node_index,
+			remaining_after,
+		)}
 
 	if remaining_after == 0 {
 		sync.atomic_store(&runtime.frame_active, 0)

@@ -17,11 +17,18 @@ import "core:thread"
 
 Worker_Context :: struct {
 	id:          int,
-	numa_node:   i16,
-	cache_group: u32,
+	steal_cursor: int,
 	runtime:     ^Scheduler_Runtime,
 	local_queue: ^Work_Deque,
+	inbox:       ^Worker_Inbox,
 	allocator:   mem.Allocator,
+}
+
+INBOX_CAPACITY :: 4096
+Worker_Inbox :: struct {
+	buffer: []int,
+	head: i32,
+	tail: i32,
 }
 
 // Worker_Mask :: bit_set[Scheduler_Worker]
@@ -59,28 +66,11 @@ worker_thread_main :: proc(worker: ^Worker_Context) {
 }
 
 worker_try_execute_one :: proc(worker: ^Worker_Context) -> bool {
-	runtime := worker.runtime
-
-	idx := worker_pop_node(worker)
-
-	when SCHED_ENABLE_STEALING {
-		if idx < 0 {
-			idx = worker_steal_node(worker)
-		}
-	}
-
+	worker_drain_inbox(worker)
+	idx, ok := deque_pop(worker.local_queue)
+	if !ok {idx = worker_steal_node(worker)}
 	if idx < 0 do return false
-	if sync.atomic_load(&runtime.frame_active) == 0 do return false
-
-	dag := runtime.active_dag
-	if dag == nil do return true
-	if idx >= len(dag.task_ids) do return true
-
-	sync.atomic_add(&runtime.inflight_exec, 1)
-	execute_node(idx, runtime, worker.id)
-	sync.atomic_sub(&runtime.inflight_exec, 1)
-
-	return true
+	return execute_node(idx, worker.runtime, worker.id)
 }
 
 worker_execute_loop :: proc(worker: ^Worker_Context, main_thread: bool) {
@@ -106,7 +96,9 @@ worker_execute_loop :: proc(worker: ^Worker_Context, main_thread: bool) {
 				if !budget_warned && main_thread {
 					ready_now := sync.atomic_load(&runtime.ready_tasks)
 					remaining_now := sync.atomic_load(&runtime.remaining_tasks)
-					if ready_now > 0 && remaining_now > 0 && runtime.frame_budget.remaining_ms < -1.0 {
+					if ready_now > 0 &&
+					   remaining_now > 0 &&
+					   runtime.frame_budget.remaining_ms < -1.0 {
 						fmt.printf(
 							"SCHED WARN worker[%d] frame budget exhausted: remaining=%.3f ready=%d remaining_tasks=%d\n",
 							worker.id,
@@ -202,52 +194,19 @@ worker_pop_node :: proc(worker: ^Worker_Context) -> int {
 // ================================================================
 
 worker_steal_node :: proc(worker: ^Worker_Context) -> int {
-	runtime := worker.runtime
-	deque_count := len(runtime.deques)
-	if deque_count <= 1 {
-		return -1
-	}
-
-	self := worker.id % deque_count
-	if self < 0 {
-		self += deque_count
-	}
-
-	for victim_offset in 1 ..< deque_count {
-		victim := (self + victim_offset) % deque_count
-
-		node, ok := deque_steal(&runtime.deques[victim])
-
+	count := worker.runtime.worker_count
+	if count <= 1 do return -1
+	start := worker.steal_cursor % count
+	for offset in 0..< count - 1 {
+		victim := (start + offset - 1) % count
+		node, ok := deque_steal(&worker.runtime.deques[victim])
 		if ok {
-			dag := runtime.active_dag
-			if dag == nil || node < 0 || node >= len(dag.task_ids) {
-				when SCHED_TRACE_WARN {
-					fmt.printf(
-						"SCHED WARN worker[%d] dropped invalid stolen node=%d from victim=%d\n",
-						worker.id,
-						node,
-						victim,
-					)
-				}
-				continue
-			}
-
-			when SCHED_TRACE_VERBOSE {
-				fmt.printf(
-					"SCHED worker[%d] stole node=%d from worker[%d] ready=%d remaining=%d\n",
-					worker.id,
-					node,
-					victim,
-					sync.atomic_load(&runtime.ready_tasks),
-					sync.atomic_load(&runtime.remaining_tasks),
-				)
-			}
-
+			worker.steal_cursor = (victim + 1) % count
 			return node
 		}
 	}
-
-	return -1
+	worker.steal_cursor = (start + 1) % count
+	return -1 
 }
 
 // ================================================================
@@ -258,7 +217,7 @@ worker_steal_node :: proc(worker: ^Worker_Context) -> int {
 // back to the OS scheduler so other workers (and the main thread) can
 // run while we're between work units.
 worker_sleep_hint :: proc() {
-	thread_yield()
+	thread.yield()
 }
 
 worker_load_guard :: proc(worker: ^Worker_Context) -> bool {
