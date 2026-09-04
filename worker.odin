@@ -23,18 +23,6 @@ Worker_Context :: struct {
 	allocator:    mem.Allocator,
 }
 
-// Worker_Mask :: bit_set[Scheduler_Worker]
-Worker_Mask :: distinct u64
-
-ctz64 :: proc(x: u64) -> int {
-	for i in 0 ..< 64 {
-		if (x & (1 << u64(i))) != 0 {
-			return i
-		}
-	}
-	return -1
-}
-
 worker_thread_main :: proc(worker: ^Worker_Context) {
 	when SCHED_TRACE_VERBOSE {
 		fmt.printf(

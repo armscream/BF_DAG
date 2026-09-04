@@ -10,7 +10,7 @@
 // Ported from DagScheduler/Dag.odin (Ymir engine). The only changes:
 //   * System_Registry.systems now uses System_Entry (System_ID + name +
 //     proc(rawptr) callback) instead of the Ymir ECS.System struct.
-//   * Frame_Budget / Frame_Island
+//   * Frame_Budget
 //     in Bifrost (they were scattered across Dag.odin in Ymir).
 package BF_DAG
 
@@ -42,13 +42,6 @@ Frame_DAG :: struct {
 DAG_Edge :: struct {
 	before: i32,
 	after:  i32,
-}
-
-Frame_Island :: struct {
-	critical_cost: f32,
-	start:         i32,
-	count:         i32,
-	depth:         i32,
 }
 
 Frame_Budget :: struct {
@@ -137,7 +130,7 @@ compile_frame_dag :: proc(
 	//* Build both adjacency directions.
 	// dependencies: node -> nodes that must finish before it
 	// dependents: node -> nodes that become eligible after it completes
-	dag_build_dependency_graph(&dag, edges, allocator)
+	dag_build_dependency_graph(&dag, edges[:], allocator)
 	//* Validate and produce deterministic topological order.
 	if !dag_topological_sort(
 		&dag,
@@ -161,9 +154,11 @@ dag_find_system_index_by_id :: proc(registry: ^System_Registry, id: Core.System_
 }
 
 //* BUILD DEPENDENCY + DEPENDENT CSR ARRAYS
-day_build_dependency_graph :: proc(dag: ^Frame_DAG, edges: []DAG_Edge, allocator: mem.Allocator) {
+dag_build_dependency_graph :: proc(dag: ^Frame_DAG, edges: []DAG_Edge, allocator: mem.Allocator) {
 	n := len(dag.task_ids)
-	// Dependency counts
+	// Count incoming and outgoing edges.
+	// dependencies_count[node] = # of predecessors
+	// dependents_count[node] = # of successors
 	for i in 0 ..< n {
 		dag.dependencies_start[i] = 0
 		dag.dependencies_count[i] = 0
@@ -171,10 +166,12 @@ day_build_dependency_graph :: proc(dag: ^Frame_DAG, edges: []DAG_Edge, allocator
 		dag.dependents_count[i] = 0
 	}
 	for edge in edges {
-		dag.dependencies_count[int(edge.after)] += 1
-		dag.dependents_count[int(edge.before)] += 1
+		before := int(edge.before)
+		after := int(edge.after)
+		dag.dependencies_count[after] += 1
+		dag.dependents_count[before] += 1
 	}
-	// Prefix sums.
+	// Prefix sums -> CSR offsets
 	dependency_total: int = 0
 	dependent_total: int = 0
 	for i in 0 ..< n {
@@ -184,23 +181,32 @@ day_build_dependency_graph :: proc(dag: ^Frame_DAG, edges: []DAG_Edge, allocator
 		dependent_total += int(dag.dependents_count[i])
 	}
 	// Allocate flat adjecency arrays.
+	delete(dag.dependencies_flat, allocator)
+	delete(dag.dependents_flat, allocator)
 	dag.dependencies_flat = make([]i32, dependency_total, allocator)
 	dag.dependents_flat = make([]i32, dependent_total, allocator)
-	// Fill using cursors.
+	if n == 0 do return
+	// Cursors begin at each node's CSR range.
 	dependency_cursor := make([]i32, n, allocator)
 	dependent_cursor := make([]i32, n, allocator)
-
 	for i in 0 ..< n {
 		dependency_cursor[i] = dag.dependencies_start[i]
 		dependent_cursor[i] = dag.dependents_start[i]
 	}
 
+	// Fill both adjecency directions. Edge: before -> after
+	// Becomes: depencies[after] += before
+	// 			dependents[before] += after
 	for edge in edges {
 		before := int(edge.before)
 		after := int(edge.after)
-		dep_idx := dependency_cursor[after]
+		dep_idx := int(dependency_cursor[after])
 		dag.dependencies_flat[dep_idx] = i32(before)
 		dependency_cursor[before] += 1
+
+		dependent_index := int(dependent_cursor[before])
+		dag.dependents_flat[dependent_index] = i32(after)
+		dependent_cursor[before] += 1
 	}
 	delete(dependency_cursor, allocator)
 	delete(dependent_cursor, allocator)
@@ -213,10 +219,14 @@ dag_topological_sort :: proc(dag: ^Frame_DAG, allocator: mem.Allocator) -> bool 
 	n := len(dag.task_ids)
 
 	delete(dag.topo_order, allocator)
-	if n == 0 do return true
-
+	if n == 0 {
+		dag.topo_order = make([]i32, 0, allocator)
+		return true
+	}
+	// Working copy of indegree.
 	indegree := make([]i32, n, allocator)
-	queue := make([dynamic]i32, 0, n, allocator) // [dynamic]i32, not []i32
+	// kahn queue.
+	queue := make([dynamic]i32, 0, n, allocator) 
 	// Initial indegree is simply the # of dependencies.
 	for i in 0 ..< n {
 		indegree[i] = dag.dependencies_count[i]
@@ -224,13 +234,16 @@ dag_topological_sort :: proc(dag: ^Frame_DAG, allocator: mem.Allocator) -> bool 
 			append(&queue, i32(i))
 		}
 	}
-	// kahn
+	// Allocate the final topological order directly.
+	dag.topo_order = make([]i32, n, allocator)
 	head := 0
-	topo := make([dynamic]i32, 0, n, allocator) // build locally, assign at end
+	topo_count := 0 
 	for head < len(queue) {
 		node := int(queue[head])
 		head += 1
-		append(&topo, i32(node))
+		
+		dag.topo_order[topo_count] = i32(node)
+		topo_count += 1
 		start := int(dag.dependents_count[node])
 		count := int(dag.dependents_count[node])
 
@@ -242,12 +255,16 @@ dag_topological_sort :: proc(dag: ^Frame_DAG, allocator: mem.Allocator) -> bool 
 			}
 		}
 	}
-	ok := len(topo) == n
-	dag.topo_order = topo[:] // assign slice view into the dynamic array
 	delete(indegree, allocator)
 	delete(queue)
-	delete(topo)
-	return ok
+
+	// A DAG containing a cycle cannot produce a complete topo ordering.
+	if topo_count != n{
+		delete(dag.topo_order, allocator)
+		dag.topo_order = nil
+		return false
+	}
+	return true
 }
 //* DEPTH
 // depth(root) = 0, depth(node) = max(depth(parent) + 1)
@@ -301,20 +318,7 @@ dag_assign_worker_affinity_compile :: proc(dag: ^Frame_DAG, worker_count: int) {
 	for i in 0 ..< len(dag.task_ids) {dag.preferred_worker[i] = i16(i % worker_count)}
 }
 
-dag_sort_islands :: proc(islands: []Frame_Island) {
-	// Pass islands as a slice parameter instead of accessing through dag
-	for i in 1 ..< len(islands) {
-		j := i
-		for j > 0 && islands[j - 1].critical_cost < islands[j].critical_cost {
-			tmp := islands[j]
-			islands[j] = islands[j - 1]
-			islands[j - 1] = tmp
-			j -= 1
-		}
-	}
-}
-
-dag_init :: proc(dag: ^Frame_DAG, n: int, worker_count: int, allocator: mem.Allocator) {
+dag_init :: proc(dag: ^Frame_DAG, n: int, _worker_count: int, allocator: mem.Allocator) {
 	dag.task_ids = make([]Task, n, allocator)
 	dag.preferred_worker = make([]i16, n, allocator)
 	dag.depth = make([]i32, n, allocator)

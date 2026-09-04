@@ -32,7 +32,7 @@ Node_Runtime :: struct {
 	state:     i32,
 }
 
-Node_Kind :: enum u8{
+Node_Kind :: enum u8 {
 	System,
 	External,
 }
@@ -48,6 +48,7 @@ Scheduler_Runtime :: struct {
 	workers:         []Worker_Context,
 	threads:         []^thread.Thread,
 	node_runtime:    [dynamic]Node_Runtime,
+	external_nodes:  [dynamic]External_Node,
 	deques:          []Work_Deque,
 	active_dag:      ^Frame_DAG,
 	compiled_dag:    Frame_DAG,
@@ -70,12 +71,6 @@ Scheduler_Runtime :: struct {
 	wake_mutex:      sync.Mutex,
 	wake_cond:       sync.Cond,
 	frame_budget:    Frame_Budget,
-}
-
-// NUMA_Partition struct needed for this to work
-NUMA_Partition :: struct {
-	numa_node: i16,
-	nodes:     [dynamic]int, // Store node INDICES, not pointers
 }
 
 scheduler_reconcile_ready :: proc(runtime: ^Scheduler_Runtime) -> i32 {
@@ -113,17 +108,13 @@ scheduler_submit_node :: proc(runtime: ^Scheduler_Runtime, node_index: int, work
 	rt := &runtime.node_runtime[node_index]
 	if sync.atomic_compare_exchange_weak(&rt.state, NODE_WAITING, NODE_READY) != NODE_WAITING do return
 
-	wid := worker_id  // local copy
+	wid := worker_id // local copy
 	if wid < 0 || wid >= runtime.worker_count do wid = 0
 	if !deque_push(&runtime.deques[wid], node_index) {
-		sync.atomic_store(&rt.state, NODE_WAITING)
-		when SCHED_TRACE_WARN {
-			fmt.printf("SCHED ERROR: failed to enqueue node %d on worker %d\n", node_index, wid)
-		}
-		return
+		panic("BF_DAG: ready deque capacity exhausted")
 	}
 	sync.atomic_add(&runtime.ready_tasks, 1)
-}   
+}
 
 //* Steal Interface (used by workers)
 scheduler_steal :: proc(runtime: ^Scheduler_Runtime, thief_id: int) -> int {
@@ -156,38 +147,17 @@ wake_dependents :: proc(node_index: int, runtime: ^Scheduler_Runtime, producer_w
 		if previous != 1 do continue
 		// This predecessor was the final dependency.
 		if sync.atomic_compare_exchange_weak(&rt.state, NODE_WAITING, NODE_READY) != NODE_WAITING do continue
-		//* IMPORTANT: 
-		// The worker that just completed this node owns it's deque, so pushing here is safe and 
+		//* IMPORTANT:
+		// The worker that just completed this node owns it's deque, so pushing here is safe and
 		// extremely cheap.
-		target := producer_worker 
-		if target <0 || target >= runtime.worker_count do target = 0
+		target := producer_worker
+		if target < 0 || target >= runtime.worker_count do target = 0
 		if !deque_push(&runtime.deques[target], dependent) {
-			when SCHED_TRACE_WARN {fmt.printf("SCHED ERROR: failed to enqueue dependent %d from node %d\n", dependent, node_index)}
-			// DO NOT pretend this node complete. Leave it READY so a future scheduler 
-			// recovery path can deal with the failed enqueue.
-			continue
+			panic("BF_DAG: ready deque capacity exhausted while waking dependent")
 		}
 		sync.atomic_add(&runtime.ready_tasks, 1)
 	}
 }
-
-// scheduler_enqueue_ready :: proc(runtime: ^Scheduler_Runtime, node_index: int, producer_worker: int){
-// 	dag := runtime.active_dag
-// 	preferred := int(dag.preferred_worker[node_index])
-// 	target := producer_worker
-// 	if preferred >0 && preferred < runtime.worker_count {
-// 		// TODO: For now, producer locality wins, preferred worker remains only a hint.
-// 	}
-// 	if target < 0 || target >= runtime.worker_count {target = 0}
-// 	if target == producer_worker {
-// 		if deque_push(&runtime.deques[target], node_index) {
-// 			sync.atomic_add(&runtime.ready_tasks, 1)
-// 			return
-// 		}
-// 	}
-// 	worker_inbox_push(&runtime.workers[target], node_index)
-// 	sync.atomic_add(&runtime.ready_tasks, 1)
-// }
 
 execute_node :: proc(node_index: int, runtime: ^Scheduler_Runtime, worker_id: int) -> bool {
 	dag := runtime.active_dag

@@ -28,11 +28,6 @@ Task :: struct {
 	state:           Task_State,
 }
 
-Task_Profile :: struct {
-	affinity: Worker_Mask,
-	priority: u8,
-}
-
 Task_State :: enum u8 {
 	Waiting,
 	Ready,

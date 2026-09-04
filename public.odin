@@ -205,12 +205,20 @@ scheduler_destroy :: proc(runtime: ^Scheduler_Runtime) {
 //* Frame Begin
 scheduler_begin_frame :: proc(runtime: ^Scheduler_Runtime, frame: ^Core.Scheduler_Frame) {
 	dag := runtime.active_dag
+	if dag == nil do return
 	frame_budget_begin(runtime, 16.6)
-
 	runtime.active_frame = frame
-	runtime.remaining_tasks = i32(len(dag.task_ids))
-	runtime.ready_tasks = 0
 
+	//* RESET all per-frame node state BEFORE submitting roots.
+	for i in 0 ..< len(dag.task_ids) {
+		rt := &runtime.node_runtime[i]
+		sync.atomic_store(&rt.remaining, dag.dependencies_count[i])
+		sync.atomic_store(&rt.state, NODE_WAITING)
+	}
+	// RESET worker deques
+	for i in 0 ..< len(runtime.deques) {deque_reset(&runtime.deques[i])}
+	sync.atomic_store(&runtime.remaining_tasks, i32(len(dag.task_ids)))
+	sync.atomic_store(&runtime.inflight_exec, 0)
 	when SCHED_TRACE_SUMMARY {
 		fmt.printf(
 			"SCHED begin frame: tasks=%d workers=%d\n",
@@ -218,11 +226,19 @@ scheduler_begin_frame :: proc(runtime: ^Scheduler_Runtime, frame: ^Core.Schedule
 			runtime.worker_count,
 		)
 	}
-	for i in 0 ..< len(runtime.deques) {deque_reset(&runtime.deques[i])}
-	ready_count: i32 = 0
+	// EMPTY DAG.
+	if len(dag.task_ids) == 0 {sync.atomic_store(&runtime.frame_active, 0)
+		sync.atomic_add(&runtime.frame_gen, 1)
+		sync.mutex_lock(&runtime.frame_mutex)
+		sync.cond_broadcast(&runtime.frame_cond)
+		sync.mutex_unlock(&runtime.frame_mutex)
+		return
+	}
+
 	// Root nodes are initially placed on worker 0.
 	// Worker 0 is the engine/main thread and owns this deque.
 	// other workers will steal from it.
+	ready_count: i32 = 0
 	for i in 0 ..< len(dag.task_ids) {
 		if dag.dependencies_count[i] != 0 {
 			continue
@@ -234,12 +250,6 @@ scheduler_begin_frame :: proc(runtime: ^Scheduler_Runtime, frame: ^Core.Schedule
 		ready_count += 1
 	}
 	sync.atomic_store(&runtime.ready_tasks, ready_count)
-
-	for i in 0 ..< len(dag.task_ids) {
-		rt := &runtime.node_runtime[i]
-		sync.atomic_store(&rt.remaining, dag.dependencies_count[i])
-		sync.atomic_store(&rt.state, NODE_WAITING)
-	}
 
 	when SCHED_TRACE_SUMMARY {
 		fmt.printf(
@@ -378,11 +388,3 @@ scheduler_create :: proc(
 
 	return scheduler
 }
-
-// Exposed API, mostly for renderer gpu fences, networking, async asset streaming, audio callbacks, OS events, procedural generation,
-// & editor background jobs. Without introducing fibers.
-scheduler_external_create :: proc(
-	runtime: ^Scheduler_Runtime,
-	name: string,
-) -> External_Node_Handle
-scheduler_external_signal :: proc(runtime: ^Scheduler_Runtime, handle: External_Node_Handle)
