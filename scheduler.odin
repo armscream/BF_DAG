@@ -37,6 +37,11 @@ Node_Kind :: enum u8 {
 	External,
 }
 
+External_Ready_Queue :: struct {
+	mutex: sync.Mutex,
+	nodes: [dynamic]int,
+}
+
 NODE_WAITING :: i32(0)
 NODE_READY :: i32(1)
 NODE_RUNNING :: i32(2)
@@ -48,7 +53,9 @@ Scheduler_Runtime :: struct {
 	workers:         []Worker_Context,
 	threads:         []^thread.Thread,
 	node_runtime:    [dynamic]Node_Runtime,
-	external_nodes:  [dynamic]External_Node,
+	external_nodes:  External_Node_Map,
+	external_mutex:  sync.Mutex,
+	external_ready:  External_Ready_Queue,
 	deques:          []Work_Deque,
 	active_dag:      ^Frame_DAG,
 	compiled_dag:    Frame_DAG,

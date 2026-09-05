@@ -1,17 +1,4 @@
 // Engine/src/Modules/BF_DAG/dag.odin
-//
-// Frame_DAG and the DAG compiler. The compiler reads the System_Registry
-// the engine assembled during scheduler_build(), materializes one DAG
-// node per system, computes the dependency bitmask (stage ordering +
-// same-stage access conflicts + explicit before/after edges), and
-// pre-computes everything the worker loop needs (depth, dependents,
-// owner_worker, cost estimate).
-//
-// Ported from DagScheduler/Dag.odin (Ymir engine). The only changes:
-//   * System_Registry.systems now uses System_Entry (System_ID + name +
-//     proc(rawptr) callback) instead of the Ymir ECS.System struct.
-//   * Frame_Budget
-//     in Bifrost (they were scattered across Dag.odin in Ymir).
 package BF_DAG
 
 import "../../Core"

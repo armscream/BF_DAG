@@ -46,6 +46,7 @@ worker_thread_main :: proc(worker: ^Worker_Context) {
 }
 
 worker_try_execute_one :: proc(worker: ^Worker_Context) -> bool {
+	scheduler_drain_external_ready(worker.runtime, worker.id)
 	idx, ok := deque_pop(worker.local_queue)
 	if !ok {idx = worker_steal_node(worker)}
 	if idx < 0 do return false
