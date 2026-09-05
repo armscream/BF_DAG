@@ -18,9 +18,9 @@
 //     the service registry when the module unloads).
 package BF_DAG
 
+import "../../Core"
 import "core:log"
 import "core:mem"
-import "../../Core"
 
 // ============================================================================
 // SERVICE NAME
@@ -64,11 +64,7 @@ service_build :: proc(
 	// arrays are owned by the caller; we don't free them.
 	registry := System_Registry {
 		systems      = systems,
-		dependencies = make(
-			[dynamic]Core.System_Dependency,
-			len(deps),
-			allocator,
-		),
+		dependencies = make([dynamic]Core.System_Dependency, len(deps), allocator),
 	}
 	for dep in deps {
 		append(&registry.dependencies, dep)
@@ -154,6 +150,7 @@ new_scheduler_service :: proc(cpu: CPU_Info, worker_count: int = 0) -> ^Core.Sch
 		wait          = service_wait,
 		start_workers = service_start_workers,
 		destroy       = service_destroy,
+		worker_count  = service_worker_count,
 	}
 
 	return &block.vtable
@@ -164,7 +161,7 @@ new_scheduler_service :: proc(cpu: CPU_Info, worker_count: int = 0) -> ^Core.Sch
 // to the service registry; the block bookkeeping keeps the runtime
 // alive across destroy_scheduler_service.
 Service_Block :: struct {
-	vtable: Core.Scheduler_Service,
+	vtable:  Core.Scheduler_Service,
 	runtime: ^Scheduler_Runtime,
 }
 
