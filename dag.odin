@@ -53,7 +53,6 @@ compile_frame_dag :: proc(
 			id         = sys.id,
 			name       = sys.name,
 			fn         = sys.callback,
-			kind       = .System,
 			read_mask  = sys.info.read_mask,
 			write_mask = sys.info.write_mask,
 		}
@@ -189,7 +188,7 @@ dag_build_dependency_graph :: proc(dag: ^Frame_DAG, edges: []DAG_Edge, allocator
 		after := int(edge.after)
 		dep_idx := int(dependency_cursor[after])
 		dag.dependencies_flat[dep_idx] = i32(before)
-		dependency_cursor[before] += 1
+		dependency_cursor[after] += 1
 
 		dependent_index := int(dependent_cursor[before])
 		dag.dependents_flat[dependent_index] = i32(after)
@@ -231,11 +230,11 @@ dag_topological_sort :: proc(dag: ^Frame_DAG, allocator: mem.Allocator) -> bool 
 		
 		dag.topo_order[topo_count] = i32(node)
 		topo_count += 1
-		start := int(dag.dependents_count[node])
+		start := int(dag.dependents_start[node])
 		count := int(dag.dependents_count[node])
 
 		for j in 0 ..< count {
-			dependent := dag.dependents_flat[start + j]
+			dependent := int(dag.dependents_flat[start + j])
 			indegree[dependent] -= 1
 			if indegree[dependent] == 0 {
 				append(&queue, i32(dependent))

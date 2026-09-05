@@ -19,6 +19,7 @@ package BF_DAG
 
 import "../../Core"
 import hm "core:container/handle_map"
+import "core:container/queue"
 import "core:fmt"
 import "core:mem"
 import "core:sync"
@@ -72,7 +73,8 @@ scheduler_runtime_init :: proc(
 	}
 
 	runtime.allocator = allocator
-	hm.dynamic_init(&runtime.external_nodes, allocator)
+	err := queue.init(&runtime.queue, 64, allocator)
+	if err != nil do return false
 	runtime.worker_count = effective_worker_count
 	runtime.running = true
 
@@ -195,7 +197,7 @@ scheduler_destroy :: proc(runtime: ^Scheduler_Runtime) {
 	// array header carries that allocator, so plain `delete` is
 	// correct.
 	delete(runtime.node_runtime)
-	hm.dynamic_destroy(&runtime.external_nodes)
+	queue.destroy(&runtime.external_ready)
 	dag_clear(&runtime.compiled_dag, alloc)
 
 	delete(runtime.deques, alloc)

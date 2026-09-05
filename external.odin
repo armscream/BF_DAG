@@ -2,6 +2,7 @@
 package BF_DAG
 
 import hm "core:container/handle_map"
+import "core:container/queue"
 import "core:sync"
 
 External_Node_Handle :: hm.Handle32
@@ -98,33 +99,30 @@ scheduler_external_destroy :: proc(runtime: ^Scheduler_Runtime, handle: External
 	hm.remove(&runtime.external_nodes, handle)
 }
 external_enqueue_ready :: proc(runtime: ^Scheduler_Runtime, node_index: int) {
-	sync.mutex_lock(&runtime.external_ready.mutex)
-
-	append(&runtime.external_ready.nodes, node_index)
-
-	sync.mutex_unlock(&runtime.external_ready.mutex)
-
-	sync.mutex_lock(&runtime.wake_mutex)
-	sync.cond_broadcast(&runtime.wake_cond)
-	sync.mutex_unlock(&runtime.wake_mutex)
+	sync.mutex_lock(&runtime.external_ready_mutex)
+    defer sync.mutex_unlock(&runtime.external_ready_mutex)
+    ok, err := queue.push_back(&runtime.external_ready, node_index)
+    if !ok || err != nil {
+        panic("BF_DAG: failed to enqueue external ready node")
+    }
+    sync.mutex_lock(&runtime.wake_mutex)
+    sync.cond_broadcast(&runtime.wake_cond)
+    sync.mutex_unlock(&runtime.wake_mutex)
 }
 scheduler_drain_external_ready :: proc(runtime: ^Scheduler_Runtime, worker_id: int) {
-	sync.mutex_lock(&runtime.external_ready.mutex)
-
-	nodes := runtime.external_ready.nodes[:]
-	runtime.external_ready.nodes = nil
-
-	sync.mutex_unlock(&runtime.external_ready.mutex)
-
-	for node_index in nodes {
-		if node_index < 0 || node_index >= len(runtime.node_runtime) do continue
-		rt := &runtime.node_runtime[node_index]
-		if sync.atomic_load(&rt.state) != NODE_READY do continue
-		if !deque_push(&runtime.deques[worker_id], node_index) {
-			panic("BF_DAG: failed to inject external-ready node")
-		}
-		sync.atomic_add(&runtime.ready_tasks, 1)
-	}
-
-	delete(nodes)
+	for {
+        node_index: int
+        ok: bool
+        sync.mutex_lock(&runtime.external_ready_mutex)
+        node_index, ok = queue.pop_front_safe(&runtime.external_ready)
+        sync.mutex_unlock(&runtime.external_ready_mutex)
+        if !ok do break
+        if node_index < 0 || node_index >= len(runtime.node_runtime) do continue
+        rt := &runtime.node_runtime[node_index]
+        if sync.atomic_load(&rt.state) != NODE_READY do continue
+        if !deque_push(&runtime.deques[worker_id], node_index) {
+            panic("BF_DAG: failed to inject external-ready node")
+        }
+        sync.atomic_add(&runtime.ready_tasks, 1)
+    }
 }

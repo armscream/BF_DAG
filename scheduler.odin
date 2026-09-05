@@ -12,6 +12,7 @@
 package BF_DAG
 
 import "../../Core"
+import "core:container/queue"
 import "core:fmt"
 import "core:mem"
 import "core:sync"
@@ -32,11 +33,6 @@ Node_Runtime :: struct {
 	state:     i32,
 }
 
-Node_Kind :: enum u8 {
-	System,
-	External,
-}
-
 External_Ready_Queue :: struct {
 	mutex: sync.Mutex,
 	nodes: [dynamic]int,
@@ -48,36 +44,35 @@ NODE_RUNNING :: i32(2)
 NODE_COMPLETE :: i32(3)
 
 Scheduler_Runtime :: struct {
-	allocator:       mem.Allocator,
-	worker_count:    int,
-	workers:         []Worker_Context,
-	threads:         []^thread.Thread,
-	node_runtime:    [dynamic]Node_Runtime,
-	external_nodes:  External_Node_Map,
-	external_mutex:  sync.Mutex,
-	external_ready:  External_Ready_Queue,
-	deques:          []Work_Deque,
-	active_dag:      ^Frame_DAG,
-	compiled_dag:    Frame_DAG,
-	active_frame:    ^Core.Scheduler_Frame,
-	global_tick:     u64,
-	current_pass:    i32,
-	next_worker:     int,
-	running:         bool,
-	workers_started: bool,
-	frame_active:    i32,
+	allocator:            mem.Allocator,
+	worker_count:         int,
+	workers:              []Worker_Context,
+	threads:              []^thread.Thread,
+	node_runtime:         [dynamic]Node_Runtime,
+	external_ready:       queue.Queue(int),
+	external_ready_mutex: sync.Mutex,
+	deques:               []Work_Deque,
+	active_dag:           ^Frame_DAG,
+	compiled_dag:         Frame_DAG,
+	active_frame:         ^Core.Scheduler_Frame,
+	global_tick:          u64,
+	current_pass:         i32,
+	next_worker:          int,
+	running:              bool,
+	workers_started:      bool,
+	frame_active:         i32,
 	// frame_gen is bumped exactly once per drained frame, by the worker
 	// that observed remaining_tasks reach 0. The main thread reads it
 	// in scheduler_wait_frame instead of taking a mutex on every frame.
-	frame_gen:       u64,
-	inflight_exec:   i32,
-	ready_tasks:     i32,
-	remaining_tasks: i32,
-	frame_mutex:     sync.Mutex,
-	frame_cond:      sync.Cond,
-	wake_mutex:      sync.Mutex,
-	wake_cond:       sync.Cond,
-	frame_budget:    Frame_Budget,
+	frame_gen:            u64,
+	inflight_exec:        i32,
+	ready_tasks:          i32,
+	remaining_tasks:      i32,
+	frame_mutex:          sync.Mutex,
+	frame_cond:           sync.Cond,
+	wake_mutex:           sync.Mutex,
+	wake_cond:            sync.Cond,
+	frame_budget:         Frame_Budget,
 }
 
 scheduler_reconcile_ready :: proc(runtime: ^Scheduler_Runtime) -> i32 {

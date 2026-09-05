@@ -19,7 +19,6 @@ Task :: struct {
 	id:              Core.System_ID,
 	name:            string,
 	fn:              Task_Proc,
-	kind:            Node_Kind,
 	read_mask:       Core.Access_Mask,
 	write_mask:      Core.Access_Mask,
 
