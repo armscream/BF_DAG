@@ -167,7 +167,13 @@ execute_node :: proc(node_index: int, runtime: ^Scheduler_Runtime, worker_id: in
 	sync.atomic_add(&runtime.inflight_exec, 1)
 	task := &dag.task_ids[node_index]
 	when SCHED_TRACE_VERBOSE {fmt.printf("SCHED executing node %d (%s)\n", node_index, task.name)}
-	if task.fn != nil do task.fn(rawptr(runtime.active_frame))
+	if task.fn != nil {
+		system_ctx := Core.Scheduler_System_Context{
+			frame = runtime.active_frame,
+			worker_id = worker_id,
+		}
+		task.fn(rawptr(&system_ctx))
+	}
 	// All dependents observe this completion only after the task itself has returned.
 	wake_dependents(node_index, runtime, worker_id)
 	sync.atomic_store(&rt.state, NODE_COMPLETE)
