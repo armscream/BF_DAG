@@ -23,3 +23,16 @@ version = { major = 0, minor = 0, patch = 1 }
 ## License
 
 - Just as all Core Modules, this module inherets Bifrost Engine's licensing agreement.
+
+## Work to do
+
+scheduler correctness tests, specifically a small deterministic test suite for:
+
+1. plain DAG dependency,
+2. two independent systems executing concurrently,
+3. external wait before frame & external signal before frame & external signal during frame,
+4. multiple DAG dependencies + external dependency,
+5. duplicate external wait,
+6. stale/destroyed external handle,
+7. single-worker external signal,
+8. multi-worker external signal.
