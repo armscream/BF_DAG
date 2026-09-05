@@ -73,8 +73,9 @@ scheduler_runtime_init :: proc(
 	}
 
 	runtime.allocator = allocator
-	err := queue.init(&runtime.queue, 64, allocator)
-	if err != nil do return false
+	hm.dynamic_init(&runtime.external_nodes, allocator)
+	err := queue.init(&runtime.external_ready, 64, allocator)
+	if err != nil do panic("BF_DAG: failed to initialize external-ready queue")
 	runtime.worker_count = effective_worker_count
 	runtime.running = true
 
@@ -183,21 +184,19 @@ scheduler_destroy :: proc(runtime: ^Scheduler_Runtime) {
 				runtime.threads[i] = nil
 			}
 		}
-
 		runtime.workers_started = false
 	}
 
 	alloc := runtime.allocator
 
-	for i in 0 ..< len(runtime.deques) {
-		delete(runtime.deques[i].buffer, alloc)
-	}
+	for i in 0 ..< len(runtime.deques) {delete(runtime.deques[i].buffer, alloc)}
 
 	// node_runtime was created with runtime.allocator; its dynamic
 	// array header carries that allocator, so plain `delete` is
 	// correct.
 	delete(runtime.node_runtime)
 	queue.destroy(&runtime.external_ready)
+	hm.dynamic_destroy(&runtime.external_nodes)
 	dag_clear(&runtime.compiled_dag, alloc)
 
 	delete(runtime.deques, alloc)
@@ -211,6 +210,10 @@ scheduler_destroy :: proc(runtime: ^Scheduler_Runtime) {
 scheduler_begin_frame :: proc(runtime: ^Scheduler_Runtime, frame: ^Core.Scheduler_Frame) {
 	dag := runtime.active_dag
 	if dag == nil do return
+
+	sync.mutex_lock(&runtime.external_mutex)
+	defer sync.mutex_unlock(&runtime.external_mutex)
+
 	frame_budget_begin(runtime, 16.6)
 	runtime.active_frame = frame
 
@@ -220,6 +223,8 @@ scheduler_begin_frame :: proc(runtime: ^Scheduler_Runtime, frame: ^Core.Schedule
 		sync.atomic_store(&rt.remaining, dag.dependencies_count[i])
 		sync.atomic_store(&rt.state, NODE_WAITING)
 	}
+	// External dependencies are layered on top of the compiled DAG.
+	scheduler_arm_external_waiters(runtime)
 	// RESET worker deques
 	for i in 0 ..< len(runtime.deques) {deque_reset(&runtime.deques[i])}
 	sync.atomic_store(&runtime.remaining_tasks, i32(len(dag.task_ids)))
@@ -245,11 +250,9 @@ scheduler_begin_frame :: proc(runtime: ^Scheduler_Runtime, frame: ^Core.Schedule
 	// other workers will steal from it.
 	ready_count: i32 = 0
 	for i in 0 ..< len(dag.task_ids) {
-		if dag.dependencies_count[i] != 0 {
-			continue
-		}
-
 		rt := &runtime.node_runtime[i]
+		if sync.atomic_load(&runtime.node_runtime[i].remaining) != 0 do continue
+
 		if sync.atomic_compare_exchange_weak(&rt.state, NODE_WAITING, NODE_READY) != NODE_WAITING do continue
 		if !deque_push(&runtime.deques[0], i) {panic("BF_DAG: failed to enqueue root node")}
 		ready_count += 1
@@ -329,6 +332,7 @@ scheduler_wait_frame :: proc(runtime: ^Scheduler_Runtime) {
 	// drain within microseconds once all workers have woken up.
 	spins: int = 0
 	for runtime.running {
+		scheduler_drain_external_ready(runtime, 0)
 		gen_now := sync.atomic_load(&runtime.frame_gen)
 		if gen_now != gen_start {
 			break

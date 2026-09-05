@@ -18,8 +18,6 @@ Frame_DAG :: struct {
 	// Topological metadata
 	topo_order:         []i32,
 	depth:              []i32,
-	// Scheduler hints
-	preferred_worker:   []i16,
 	// Cost metadata
 	cost_estimate:      []f32,
 	critical_cost:      []f32,
@@ -125,7 +123,6 @@ compile_frame_dag :: proc(
 	//* Compute graph metadata
 	dag_compute_depths(&dag)
 	dag_compute_critical_cost(&dag)
-	dag_assign_worker_affinity_compile(&dag, worker_count)
 
 	delete(edges)
 	return dag
@@ -293,20 +290,9 @@ dag_compute_critical_cost :: proc(dag: ^Frame_DAG) {
 		}
 	}
 }
-//* WORKER HINT
-// This is only an initial placement hint.
-// The scheduler remains responsible for actual execution, stealing and locality.
-dag_assign_worker_affinity_compile :: proc(dag: ^Frame_DAG, worker_count: int) {
-	if worker_count <= 0 {
-		for i in 0 ..< len(dag.preferred_worker) {dag.preferred_worker[i] = 0}
-		return
-	}
-	for i in 0 ..< len(dag.task_ids) {dag.preferred_worker[i] = i16(i % worker_count)}
-}
 
 dag_init :: proc(dag: ^Frame_DAG, n: int, _worker_count: int, allocator: mem.Allocator) {
 	dag.task_ids = make([]Task, n, allocator)
-	dag.preferred_worker = make([]i16, n, allocator)
 	dag.depth = make([]i32, n, allocator)
 	dag.cost_estimate = make([]f32, n, allocator)
 	dag.critical_cost = make([]f32, n, allocator)
@@ -329,7 +315,6 @@ dag_clear :: proc(dag: ^Frame_DAG, allocator: mem.Allocator) {
 	delete(dag.dependents_flat, allocator)
 	delete(dag.topo_order, allocator)
 	delete(dag.depth, allocator)
-	delete(dag.preferred_worker, allocator)
 	delete(dag.cost_estimate, allocator)
 	delete(dag.critical_cost, allocator)
 	dag^ = Frame_DAG{}

@@ -33,11 +33,6 @@ Node_Runtime :: struct {
 	state:     i32,
 }
 
-External_Ready_Queue :: struct {
-	mutex: sync.Mutex,
-	nodes: [dynamic]int,
-}
-
 NODE_WAITING :: i32(0)
 NODE_READY :: i32(1)
 NODE_RUNNING :: i32(2)
@@ -49,6 +44,8 @@ Scheduler_Runtime :: struct {
 	workers:              []Worker_Context,
 	threads:              []^thread.Thread,
 	node_runtime:         [dynamic]Node_Runtime,
+	external_nodes:       External_Node_Map,
+	external_mutex:       sync.Mutex,
 	external_ready:       queue.Queue(int),
 	external_ready_mutex: sync.Mutex,
 	deques:               []Work_Deque,
