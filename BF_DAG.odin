@@ -103,7 +103,7 @@ module_register :: proc(ctx: ^Core.Lib_Context) -> bool {
 		return false
 	}
 
-	log.infof("[DAG] scheduler service registered (%d workers)", service_worker_count(service))
+	log.infof("[DAG] scheduler service registered (%d workers)", scheduler_service_worker_count(service))
 	return true
 }
 
@@ -142,7 +142,7 @@ detect_cpu_info :: proc() -> CPU_Info {
 	}
 }
 
-service_worker_count :: proc(service: ^Core.Scheduler_Service) -> int {
+scheduler_service_worker_count :: proc(service: ^Core.Scheduler_Service) -> int {
 	if service == nil || service.instance == nil do return 0
 	runtime := cast(^Scheduler_Runtime)service.instance
 	return runtime.worker_count
