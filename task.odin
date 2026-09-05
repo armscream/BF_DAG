@@ -35,8 +35,9 @@ Task_State :: enum u8 {
 }
 
 task_conflict :: proc(a, b: ^Task) -> bool {
-	if (a.write_mask.bits & b.write_mask.bits) != 0 do return true
-	if (a.write_mask.bits & b.read_mask.bits) != 0 do return true
-	if (a.read_mask.bits & b.write_mask.bits) != 0 do return true
+	if a == nil || b == nil do return false
+	if Core.access_mask_intersects(a.write_mask, b.write_mask) do return true
+	if Core.access_mask_intersects(a.write_mask, b.read_mask,) do return true
+	if Core.access_mask_intersects(a.read_mask,b.write_mask,) do return true
 	return false
 }
