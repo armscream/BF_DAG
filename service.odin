@@ -25,8 +25,11 @@ import "core:mem"
 // ============================================================================
 // SERVICE NAME
 // ============================================================================
-
-SCHEDULER_SERVICE_NAME :: "BF_DAG.Scheduler"
+//
+// SCHEDULER_SERVICE_NAME is re-exported as Core.BF_DAG_SCHEDULER_SERVICE_NAME
+// so consumers do not need a package dependency on BF_DAG. The local
+// alias stays for clarity inside this module.
+SCHEDULER_SERVICE_NAME :: Core.BF_DAG_SCHEDULER_SERVICE_NAME
 
 // ============================================================================
 // SERVICE IMPLS
@@ -117,6 +120,78 @@ service_destroy :: proc(service: ^Core.Scheduler_Service) {
 }
 
 // ============================================================================
+// EXTERNAL NODE + PRE-FRAME HOOK VTABLE IMPLS
+// ============================================================================
+//
+// These are the ABI hooks that modules (BF_GPU, BF_Net, BF_Audio,
+// asset streamer, ...) call to wire external synchronization
+// boundaries into the DAG without taking a direct package dependency
+// on BF_DAG. See Core/scheduler.odin::Scheduler_Service for the
+// full ABI surface.
+
+service_external_create :: proc(service: ^Core.Scheduler_Service) -> Core.External_Node_Handle {
+	if service == nil || service.instance == nil {
+		return Core.EXTERNAL_NODE_HANDLE_INVALID
+	}
+	runtime := cast(^Scheduler_Runtime)service.instance
+	return scheduler_external_create(runtime)
+}
+
+service_external_destroy :: proc(service: ^Core.Scheduler_Service, handle: Core.External_Node_Handle) -> bool {
+	if service == nil || service.instance == nil do return false
+	runtime := cast(^Scheduler_Runtime)service.instance
+	scheduler_external_destroy(runtime, handle)
+	return true
+}
+
+service_external_signal :: proc(service: ^Core.Scheduler_Service, handle: Core.External_Node_Handle) -> bool {
+	if service == nil || service.instance == nil do return false
+	runtime := cast(^Scheduler_Runtime)service.instance
+	return scheduler_external_signal(runtime, handle)
+}
+
+service_external_reset :: proc(service: ^Core.Scheduler_Service, handle: Core.External_Node_Handle) -> bool {
+	if service == nil || service.instance == nil do return false
+	runtime := cast(^Scheduler_Runtime)service.instance
+	return scheduler_external_reset(runtime, handle)
+}
+
+service_external_wait_for_system_name :: proc(
+	service: ^Core.Scheduler_Service,
+	handle: Core.External_Node_Handle,
+	system_name: cstring,
+) -> bool {
+	if service == nil || service.instance == nil do return false
+	runtime := cast(^Scheduler_Runtime)service.instance
+	dag := runtime.active_dag
+	if dag == nil do return false
+
+	// compiled_dag.task_ids mirrors the registry.systems ordering used
+	// at compile time (see compile_frame_dag in dag.odin), so the
+	// node_index is the same as the DAG node_index. Look up by name.
+	target := string(system_name)
+	node_index := -1
+	for task, i in dag.task_ids {
+		if task.name == target {
+			node_index = i
+			break
+		}
+	}
+	if node_index < 0 do return false
+	return scheduler_external_wait(runtime, handle, node_index)
+}
+
+service_register_pre_frame_hook :: proc(
+	service: ^Core.Scheduler_Service,
+	hook: Core.Scheduler_Pre_Frame_Hook,
+	user_data: rawptr,
+) -> bool {
+	if service == nil || service.instance == nil do return false
+	runtime := cast(^Scheduler_Runtime)service.instance
+	return scheduler_register_pre_frame_hook(runtime, hook, user_data)
+}
+
+// ============================================================================
 // SERVICE FACTORY
 // ============================================================================
 
@@ -143,14 +218,20 @@ new_scheduler_service :: proc(cpu: CPU_Info, worker_count: int = 0) -> ^Core.Sch
 	scheduler_runtime_init(block.runtime, effective_worker_count, context.allocator)
 
 	block.vtable = Core.Scheduler_Service {
-		instance      = rawptr(block.runtime),
-		build         = service_build,
-		begin_frame   = service_begin_frame,
-		run           = service_run,
-		wait          = service_wait,
-		start_workers = service_start_workers,
-		destroy       = service_destroy,
-		worker_count  = service_worker_count,
+		instance                       = rawptr(block.runtime),
+		build                          = service_build,
+		begin_frame                    = service_begin_frame,
+		run                            = service_run,
+		wait                           = service_wait,
+		start_workers                  = service_start_workers,
+		destroy                        = service_destroy,
+		worker_count                   = service_worker_count,
+		external_create                = service_external_create,
+		external_destroy               = service_external_destroy,
+		external_signal                = service_external_signal,
+		external_reset                 = service_external_reset,
+		external_wait_for_system_name  = service_external_wait_for_system_name,
+		register_pre_frame_hook        = service_register_pre_frame_hook,
 	}
 
 	return &block.vtable

@@ -38,6 +38,17 @@ NODE_READY :: i32(1)
 NODE_RUNNING :: i32(2)
 NODE_COMPLETE :: i32(3)
 
+// Pre_Frame_Hook is the ABI for hooks registered via
+// scheduler_register_pre_frame_hook. They run inside begin_frame,
+// after per-frame node reset + arm_external_waiters and BEFORE the
+// frame becomes active (frame_active=1). Hooks are the supported
+// way for modules to attach per-frame external waits (e.g. the
+// GPU completion fence gating the next frame's Render_Upload).
+Pre_Frame_Hook :: struct {
+	callback:  Core.Scheduler_Pre_Frame_Hook,
+	user_data: rawptr,
+}
+
 Scheduler_Runtime :: struct {
 	allocator:            mem.Allocator,
 	worker_count:         int,
@@ -70,6 +81,12 @@ Scheduler_Runtime :: struct {
 	wake_mutex:           sync.Mutex,
 	wake_cond:            sync.Cond,
 	frame_budget:         Frame_Budget,
+	// pre_frame_hooks fire at the top of each frame, between
+	// arm_external_waiters and frame_active=1. They let modules
+	// attach per-frame external waits without leaking BF_DAG package
+	// boundaries (the registration API lives on the Scheduler_Service
+	// vtable in Core).
+	pre_frame_hooks:      [dynamic]Pre_Frame_Hook,
 }
 
 scheduler_reconcile_ready :: proc(runtime: ^Scheduler_Runtime) -> i32 {
@@ -85,6 +102,31 @@ scheduler_reconcile_ready :: proc(runtime: ^Scheduler_Runtime) -> i32 {
 
 	sync.atomic_store(&runtime.ready_tasks, ready)
 	return ready
+}
+
+// scheduler_register_pre_frame_hook appends a hook to the runtime's
+// pre_frame_hooks list. Hooks run inside begin_frame, after the
+// per-frame node reset + arm_external_waiters and BEFORE the frame
+// becomes active. Multiple hooks fire in registration order; a nil
+// callback or a nil runtime are silent no-ops. Returns true on success.
+scheduler_register_pre_frame_hook :: proc(
+	runtime: ^Scheduler_Runtime,
+	hook: Core.Scheduler_Pre_Frame_Hook,
+	user_data: rawptr,
+) -> bool {
+	if runtime == nil || hook == nil do return false
+	append(&runtime.pre_frame_hooks, Pre_Frame_Hook{callback = hook, user_data = user_data})
+	return true
+}
+
+// scheduler_invoke_pre_frame_hooks fires every registered hook. Must
+// be called inside begin_frame with external_mutex NOT held (hooks
+// themselves acquire it through scheduler_external_wait).
+scheduler_invoke_pre_frame_hooks :: proc(runtime: ^Scheduler_Runtime) {
+	if runtime == nil do return
+	for &h in runtime.pre_frame_hooks {
+		if h.callback != nil do h.callback(rawptr(runtime), h.user_data)
+	}
 }
 
 scheduler_ready_inc :: proc(runtime: ^Scheduler_Runtime) {

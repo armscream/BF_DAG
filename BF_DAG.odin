@@ -64,6 +64,7 @@ when #config(BUILDING_BF_DAG_DLL, false) {
 
 module_load :: proc(ctx: ^Core.Lib_Context) -> bool {
 	_ = ctx
+	context.logger = log.create_console_logger()
 	log.info("[DAG] loaded")
 	return true
 }

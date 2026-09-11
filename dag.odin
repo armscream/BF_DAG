@@ -136,6 +136,21 @@ dag_find_system_index_by_id :: proc(registry: ^System_Registry, id: Core.System_
 	return -1
 }
 
+// dag_find_system_index_by_name resolves a system by its registered
+// name (e.g. "BF_GPU.FramePresent"). Returns -1 if no system matches.
+// The name is compared against the System_Entry.name field — the
+// engine only persists that name through scheduler_build, so this is
+// the stable lookup key for pre-frame hooks that want to attach an
+// external wait without knowing the System_ID ahead of time.
+dag_find_system_index_by_name :: proc(registry: ^System_Registry, name: cstring) -> int {
+	if registry == nil || name == nil do return -1
+	target := string(name)
+	for i in 0 ..< len(registry.systems) {
+		if registry.systems[i].name == target do return i
+	}
+	return -1
+}
+
 //* BUILD DEPENDENCY + DEPENDENT CSR ARRAYS
 dag_build_dependency_graph :: proc(dag: ^Frame_DAG, edges: []DAG_Edge, allocator: mem.Allocator) {
 	n := len(dag.task_ids)
@@ -145,7 +160,7 @@ dag_build_dependency_graph :: proc(dag: ^Frame_DAG, edges: []DAG_Edge, allocator
 	for i in 0 ..< n {
 		dag.dependencies_start[i] = 0
 		dag.dependencies_count[i] = 0
-		dag.dependents_flat[i] = 0
+		dag.dependents_start[i] = 0
 		dag.dependents_count[i] = 0
 	}
 	for edge in edges {

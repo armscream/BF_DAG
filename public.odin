@@ -75,7 +75,7 @@ scheduler_runtime_init :: proc(
 	runtime.allocator = allocator
 	hm.dynamic_init(&runtime.external_nodes, allocator)
 	err := queue.init(&runtime.external_ready, 64, allocator)
-	if err != nil do panic("BF_DAG: failed to initialize external-ready queue")
+	if err != nil {panic("BF_DAG: failed to initialize external-ready queue")}
 	runtime.worker_count = effective_worker_count
 	runtime.running = true
 
@@ -91,6 +91,7 @@ scheduler_runtime_init :: proc(
 	runtime.workers_started = false
 	runtime.frame_active = 0
 	runtime.frame_gen = 0
+	runtime.pre_frame_hooks = make([dynamic]Pre_Frame_Hook, allocator)
 
 	// IMPORTANT: ensure clean state before threads start
 	runtime.active_dag = nil
@@ -198,6 +199,7 @@ scheduler_destroy :: proc(runtime: ^Scheduler_Runtime) {
 	queue.destroy(&runtime.external_ready)
 	hm.dynamic_destroy(&runtime.external_nodes)
 	dag_clear(&runtime.compiled_dag, alloc)
+	delete(runtime.pre_frame_hooks)
 
 	delete(runtime.deques, alloc)
 	delete(runtime.workers, alloc)
@@ -212,7 +214,6 @@ scheduler_begin_frame :: proc(runtime: ^Scheduler_Runtime, frame: ^Core.Schedule
 	if dag == nil do return
 
 	sync.mutex_lock(&runtime.external_mutex)
-	defer sync.mutex_unlock(&runtime.external_mutex)
 
 	frame_budget_begin(runtime, 16.6)
 	runtime.active_frame = frame
@@ -225,6 +226,18 @@ scheduler_begin_frame :: proc(runtime: ^Scheduler_Runtime, frame: ^Core.Schedule
 	}
 	// External dependencies are layered on top of the compiled DAG.
 	scheduler_arm_external_waiters(runtime)
+
+	sync.mutex_unlock(&runtime.external_mutex)
+
+	//* PRE-FRAME HOOKS
+	// Modules (BF_GPU, BF_Net, ...) attach per-frame external waits
+	// here. Hooks acquire external_mutex themselves through
+	// scheduler_external_wait, so the mutex MUST be released before
+	// this point. Workers on threads 1..N are still parked on
+	// frame_active==0 and worker 0 is not driven until `run`, so the
+	// hooks run single-threaded with respect to DAG mutation.
+	scheduler_invoke_pre_frame_hooks(runtime)
+
 	// RESET worker deques
 	for i in 0 ..< len(runtime.deques) {deque_reset(&runtime.deques[i])}
 	sync.atomic_store(&runtime.remaining_tasks, i32(len(dag.task_ids)))
