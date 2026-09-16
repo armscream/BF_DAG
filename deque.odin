@@ -115,12 +115,3 @@ deque_steal :: proc(d: ^Work_Deque) -> (int, bool) {
 
 	return node, true
 }
-
-deque_empty :: proc(d: ^Work_Deque) -> bool {
-	return sync.atomic_load(&d.top) >= sync.atomic_load(&d.bottom)
-}
-
-deque_clear :: proc(d: ^Work_Deque) {
-	sync.atomic_store(&d.top, 0)
-	sync.atomic_store(&d.bottom, 0)
-}
